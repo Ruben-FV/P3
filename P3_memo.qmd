@@ -1,0 +1,190 @@
+---
+title: "P3: Trip Generation"
+author: "Jose Ruben Figueroa Velasco"
+format: html
+editor: visual
+---
+
+## Explaining Weekend Home-based Recreational Trips
+
+This is the code that supports the results reported in the memo "Explaining Weekend Home-based Recreational Trips".
+
+## Libraries
+
+The libraries required for the analysis are as follows:
+
+```{r}
+#| echo: false
+library(tidyverse)
+library(here)
+library(knitr)
+library(srvyr)
+library(mlogit)
+library(caret)
+library(pscl)
+
+here("code",
+     "mlogit_helpers.R") |>
+  source()
+```
+
+## Datasets
+
+The analysis leverages the information available at the household, personal and trip level from the 2017 National Household Travel Survey. We will limit our analysis to the weekends:
+
+```{r}
+hh_data <- here("data",
+                "NHTS",
+                "hhpub.csv") |>
+  read_csv(show_col_types = FALSE) |>
+  filter(TRAVDAY == "01" | TRAVDAY == "07")
+
+person_data <- here("data",
+                    "NHTS",
+                    "perpub.csv") |>
+  read_csv(show_col_types = FALSE) |>
+  filter(TRAVDAY == "01" | TRAVDAY == "07")
+
+trip_data <- here("data",
+                    "NHTS",
+                    "trippub.csv") |>
+  read_csv(show_col_types = FALSE) |>
+  filter(TRAVDAY == "01" | TRAVDAY == "07") |>
+  select(HOUSEID,
+         PERSONID,
+         TDTRPNUM,
+         TRIPPURP,
+         WHYFROM,
+         WHYTO,
+         TRPTRANS)
+```
+
+## Link Up Unlinked Trips
+
+Before filtering for weekend home-based recreational trips, it is important to link up unlinked trips:
+
+```{r}
+trip_data <- trip_data |>
+  mutate(transfer_trip = WHYTO == "07" | WHYFROM == "07")
+
+transfer_trips <- trip_data |>
+  filter(transfer_trip) |>
+  filter(WHYTO != WHYFROM) # remove trips that begin AND end with a transfer
+
+next_destination <- c(transfer_trips$WHYTO[2:nrow(transfer_trips)], "last")
+
+transfer_trips <- transfer_trips |>
+  mutate(next_destination = next_destination) |>
+  mutate(WHYTO = ifelse(WHYTO == "07", next_destination, WHYTO)) |>
+  filter(WHYFROM != "07") |>
+  select(-next_destination)
+
+trip_data <- trip_data |>
+  filter(!transfer_trip) |>
+  rbind(transfer_trips) |>
+  select(-TRIPPURP, -TRPTRANS, -transfer_trip)
+```
+
+## Trip Identification
+
+In this section we identify weekend home-based recreational trips (WHBR) and select the predictors of interest:
+
+```{r}
+# Identify weekend home-based recreational trips:
+home <- c("01")
+recreational <- c("15")
+
+trip_data <- trip_data |>
+  mutate(purpose = case_when(WHYTO == home & WHYFROM %in% recreational ~ "WHBR",
+                             WHYTO == recreational & WHYFROM %in% home ~ "WHBR",
+                             TRUE ~ "OTHER"))
+
+# Predictors:
+## Household data (veh_avail, income, rural):
+hh_data <- hh_data |>
+  mutate(veh_avail = case_when(HHVEHCNT == 0 ~ "Zero",
+                               DRVRCNT > HHVEHCNT ~ "Insuff.",
+                               TRUE ~ "Suff.")) |>
+  mutate(HHFAMINC = as.numeric(HHFAMINC)) |>
+  filter(HHFAMINC > 0) |>
+  mutate(income = case_when(HHFAMINC < 4 ~ "low",
+                             HHFAMINC < 5 & HHSIZE > 1 ~ "low",
+                             HHFAMINC < 6 & HHSIZE > 3 ~ "low",
+                             HHFAMINC < 7 & HHSIZE > 5 ~ "low",
+                             HHFAMINC < 8 & HHSIZE > 7 ~ "low",
+                             HHFAMINC > 8 ~ "high",
+                            TRUE ~ "middle")) |>
+  mutate(income = factor(income, levels = c("low", "middle", "high"))) |>
+  mutate(urban = case_when(URBRUR == "01" ~ "urban",
+                           TRUE ~ "rural")) |>
+  select(HOUSEID,
+         veh_avail,
+         income,
+         urban)
+
+## Personal data (sex, race, age)
+persons <- person_data |>
+  select(HOUSEID, PERSONID, R_SEX, R_RACE, R_AGE) |>
+  mutate(male = R_SEX == "01") |>
+  mutate(white = R_RACE == "01") |>
+  inner_join(hh_data)
+
+# Count WHBR trips and merge datasets:
+whbr_trips <- trip_data |>
+  filter(purpose == "WHBR") |>
+  group_by(HOUSEID, PERSONID) |>
+  summarise(whbr_trips = n())
+
+persons <- persons |>
+  left_join(whbr_trips) |>
+  replace_na(list(whbr_trips = 0)) |>
+  mutate(income = factor(income, levels = c("low", "middle", "high")))
+```
+
+## Sample Visualization
+
+The distribution of the number of WHBR trips is as follows:
+
+```{r}
+ggplot(persons) +
+  geom_histogram(aes(x = whbr_trips),
+                 binwidth = 1,
+                 color = "gray",
+                 fill = "lightblue") +
+  scale_x_continuous(name = "Number of weekend home-based recreational trips",
+                     breaks = seq(0, 12, by=1)) +
+  scale_y_continuous(name = "Number of individuals in sample") +
+  theme_minimal()
+```
+
+Given the distribution of the number of WHBR trips, either a Poisson regression or a negative binomial regression appears to be more appropriate than a simple linear regression to explore the data. To explore which regression is required, we will perform the following test:
+
+```{r}
+persons |>
+  summarise(mean_whbr_trips = mean(whbr_trips),
+            st_dev_whbr_trips = sd(whbr_trips)) |>
+  kable(digits = 3)
+```
+
+Since the standard deviation is much greater than the mean of the number of WHBR trips, we will use a negative binomial regression to perform the analysis.
+
+## Model Estimation
+
+```{r}
+library(MASS)
+
+persons$R_AGE2 <- persons$R_AGE^2
+whbr_model <- glm.nb(whbr_trips ~ 
+                     veh_avail + 
+                     income + 
+                     urban +
+                     male + 
+                     white +
+                     R_AGE + 
+                     R_AGE2, 
+   data = persons)
+
+summary(whbr_model)
+```
+
+The theta parameter is close to zero, suggesting that the number of WHBR trips presents over-dispersion and, thus, the negative binomial model is appropriate.
